@@ -47,7 +47,7 @@ How to run training:
 python main_gan.py --mol_data_dir data/gdb9_9nodes.sparsedataset
 ```
 
-*Important!*
+**Important!**
 To speed up the training, the RL part is commented out (see solver_gan.py). We propose to start experiments with pure GAN setup and later add RL training. The full training takes around 5 hours on V100 GPU.
 
 ## Usage
