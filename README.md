@@ -24,6 +24,32 @@ This repository contains a PyTorch implementation of MolGAN: An implicit generat
 </strong>
 </p>
 
+## AIRI summer school 
+How to build environment:
+```
+conda create --name molgan_env python=3.12
+conda activate molgan_env
+conda install scikit-learn
+pip3 install torch --index-url https://download.pytorch.org/whl/cu118
+conda install pandas
+conda install rdkit
+pip install pysmiles
+```
+
+How to download and process data:
+```
+sudo bash download_dataset.sh # download QM9 dataset
+python sparse_molecular_dataset.py
+```
+
+How to run training:
+```
+python main_gan.py --mol_data_dir data/gdb9_9nodes.sparsedataset
+```
+
+*Important!*
+To speed up the training, the RL part is commented out (see solver_gan.py). We propose to start experiments with pure GAN setup and later add RL training. The full training takes around 5 hours on V100 GPU.
+
 ## Usage
 You can either run MolGAN or MolVAE. Please download and preprocess the dataset before training molGAN. 
 ### Data Download 

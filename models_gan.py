@@ -2,7 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from layers import GraphConvolution, GraphAggregation, MultiGraphConvolutionLayers, MultiDenseLayer
+from layers import (
+    GraphConvolution,
+    GraphAggregation,
+    MultiGraphConvolutionLayers,
+    MultiDenseLayer,
+)
 
 
 class Generator(nn.Module):
@@ -23,7 +28,9 @@ class Generator(nn.Module):
 
     def forward(self, x):
         output = self.multi_dense_layer(x)
-        edges_logits = self.edges_layer(output).view(-1, self.edges, self.vertexes, self.vertexes)
+        edges_logits = self.edges_layer(output).view(
+            -1, self.edges, self.vertexes, self.vertexes
+        )
         edges_logits = (edges_logits + edges_logits.permute(0, 1, 3, 2)) / 2
         edges_logits = self.dropoout(edges_logits.permute(0, 2, 3, 1))
 
@@ -36,15 +43,27 @@ class Generator(nn.Module):
 class Discriminator(nn.Module):
     """Discriminator network with PatchGAN."""
 
-    def __init__(self, conv_dim, m_dim, b_dim, with_features=False, f_dim=0, dropout_rate=0.):
+    def __init__(
+        self, conv_dim, m_dim, b_dim, with_features=False, f_dim=0, dropout_rate=0.0
+    ):
         super(Discriminator, self).__init__()
         self.activation_f = torch.nn.Tanh()
         graph_conv_dim, aux_dim, linear_dim = conv_dim
         # discriminator
-        self.gcn_layer = GraphConvolution(m_dim, graph_conv_dim, b_dim, with_features, f_dim, dropout_rate)
-        self.agg_layer = GraphAggregation(graph_conv_dim[-1] + m_dim, aux_dim, self.activation_f, with_features, f_dim,
-                                          dropout_rate)
-        self.multi_dense_layer = MultiDenseLayer(aux_dim, linear_dim, self.activation_f, dropout_rate=dropout_rate)
+        self.gcn_layer = GraphConvolution(
+            m_dim, graph_conv_dim, b_dim, with_features, f_dim, dropout_rate
+        )
+        self.agg_layer = GraphAggregation(
+            graph_conv_dim[-1] + m_dim,
+            aux_dim,
+            self.activation_f,
+            with_features,
+            f_dim,
+            dropout_rate,
+        )
+        self.multi_dense_layer = MultiDenseLayer(
+            aux_dim, linear_dim, self.activation_f, dropout_rate=dropout_rate
+        )
 
         self.output_layer = nn.Linear(linear_dim[-1], 1)
 
