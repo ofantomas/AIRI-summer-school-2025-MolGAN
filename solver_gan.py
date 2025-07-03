@@ -34,12 +34,15 @@ class Solver(object):
         self.g_conv_dim = config.g_conv_dim
         self.d_conv_dim = config.d_conv_dim
         self.la = config.lambda_wgan
-        self.lambda_rec = config.lambda_rec
         self.la_gp = config.lambda_gp
         self.post_method = config.post_method
         self.eval_freq = config.eval_freq
-
-        self.metric = "validity,qed"
+        self.n_molecules_validation = config.n_molecules_validation
+        self.no_rl_epochs = config.no_rl_epochs
+        # self.metric = "validity,qed"
+        self.metric = config.metric
+        # Batch-level discriminator flag
+        self.batch_discriminator = getattr(config, "batch_discriminator", False)
 
         # Training configurations.
         self.batch_size = config.batch_size
@@ -83,15 +86,32 @@ class Solver(object):
             self.dropout,
         )
         self.D = Discriminator(
-            self.d_conv_dim, self.m_dim, self.b_dim - 1, self.dropout
+            self.d_conv_dim,
+            self.m_dim,
+            self.b_dim - 1,
+            dropout_rate=self.dropout,
+            batch_discriminator=self.batch_discriminator,
         )
         self.V = Discriminator(
-            self.d_conv_dim, self.m_dim, self.b_dim - 1, self.dropout
+            self.d_conv_dim,
+            self.m_dim,
+            self.b_dim - 1,
+            dropout_rate=self.dropout,
+            batch_discriminator=self.batch_discriminator,
         )
 
-        self.g_optimizer = torch.optim.RMSprop(self.G.parameters(), self.g_lr)
-        self.d_optimizer = torch.optim.RMSprop(self.D.parameters(), self.d_lr)
-        self.v_optimizer = torch.optim.RMSprop(self.V.parameters(), self.g_lr)
+        # ------------------------------------------------------------------
+        # TF implementation used Adam on all nets – mirror that here.
+        # ------------------------------------------------------------------
+        self.g_optimizer = torch.optim.Adam(
+            self.G.parameters(), lr=self.g_lr, betas=(0.0, 0.9)
+        )
+        self.d_optimizer = torch.optim.Adam(
+            self.D.parameters(), lr=self.d_lr, betas=(0.0, 0.9)
+        )
+        self.v_optimizer = torch.optim.Adam(
+            self.V.parameters(), lr=self.g_lr, betas=(0.0, 0.9)
+        )
         self.print_network(self.G, "G", self.log)
         self.print_network(self.D, "D", self.log)
         self.print_network(self.V, "V", self.log)
@@ -254,14 +274,15 @@ class Solver(object):
 
         # Start training.
         if self.mode == "train":
+            self.validate_epoch(epoch=start_epoch, val_n=self.n_molecules_validation)
             print("Start training...")
             for i in range(start_epoch, self.num_epochs):
                 self.train_epoch(epoch=i)
                 if (i + 1) % self.eval_freq == 0:
-                    self.validate_epoch(epoch=i)
+                    self.validate_epoch(epoch=i, val_n=self.n_molecules_validation)
         elif self.mode == "test":
             assert self.resume_epoch is not None
-            self.validate_epoch(epoch_i=start_epoch)
+            self.validate_epoch(epoch=start_epoch)
         else:
             raise NotImplementedError
 
@@ -299,12 +320,6 @@ class Solver(object):
             )
 
     def train_epoch(self, epoch):
-        # The first several epochs using RL to purse stability (not used).
-        if epoch < 0:
-            cur_la = 0
-        else:
-            cur_la = self.la
-
         # Recordings
         losses = defaultdict(list)
 
@@ -338,13 +353,18 @@ class Solver(object):
             )
             logits_fake, features_fake = self.D(edges_hat, None, nodes_hat)
 
-            # Compute losses for gradient penalty.
-            eps = torch.rand(logits_real.size(0), 1, 1, 1).to(self.device)
+            # Compute losses for gradient penalty (WGAN-GP). Use *independent* eps masks
+            # for adjacency and node tensors to reduce correlation and improve stability.
+            eps_e = torch.rand(a_tensor.size(0), 1, 1, 1, device=self.device)
+            eps_n = torch.rand(x_tensor.size(0), 1, 1, device=self.device)
+
             x_int0 = (
-                (eps * a_tensor + (1 - eps) * edges_hat).detach().requires_grad_(True)
+                (eps_e * a_tensor + (1 - eps_e) * edges_hat)
+                .detach()
+                .requires_grad_(True)
             )
             x_int1 = (
-                (eps.squeeze(-1) * x_tensor + (1.0 - eps.squeeze(-1)) * nodes_hat)
+                (eps_n * x_tensor + (1 - eps_n) * nodes_hat)
                 .detach()
                 .requires_grad_(True)
             )
@@ -357,74 +377,70 @@ class Solver(object):
             d_loss_fake = torch.mean(logits_fake)
             loss_D = -d_loss_real + d_loss_fake + self.la_gp * grad_penalty
 
-            if cur_la > 0:
-                losses["l_D/R"].append(d_loss_real.item())
-                losses["l_D/F"].append(d_loss_fake.item())
-                losses["l_D"].append(loss_D.item())
+            losses["l_D/R"].append(d_loss_real.item())
+            losses["l_D/F"].append(d_loss_fake.item())
+            losses["l_D"].append(loss_D.item())
 
-            # Optimise discriminator.
-            if cur_step % self.n_critic != 0 and cur_la > 0:
-                self.reset_grad()
-                loss_D.backward()
-                self.d_optimizer.step()
+            self.reset_grad()
+            loss_D.backward()
+            self.d_optimizer.step()
 
             # =================================================================================== #
-            #                               3. Train the generator                                #
+            #                               3. Train the generator & value net                   #
             # =================================================================================== #
 
-            # Z-to-target
+            # (re-sample latent for generator step – keeps it consistent with TF code)
+            z = self.sample_z(self.batch_size)
             edges_logits, nodes_logits = self.G(z)
-            # Postprocess with Gumbel softmax
             (edges_hat, nodes_hat) = self.postprocess(
                 (edges_logits, nodes_logits), self.post_method
             )
-            logits_fake, features_fake = self.D(edges_hat, None, nodes_hat)
+            logits_fake, _ = self.D(edges_hat, None, nodes_hat)
+            logits_real, _ = self.D(a_tensor.detach(), None, x_tensor.detach())
 
-            # Value losses
-            # value_logit_real, _ = self.V(
-            #     a_tensor.detach(), None, x_tensor.detach(), torch.sigmoid
-            # )
-            # value_logit_fake, _ = self.V(
-            #     edges_hat.detach(), None, nodes_hat.detach(), torch.sigmoid
-            # )
+            # -------------------- Generator adversarial / feature matching loss -----------------
+            loss_G_adv = -torch.mean(logits_fake)
 
-            # Feature mapping losses. Not used anywhere in the PyTorch version.
-            f_loss = F.mse_loss(features_real.mean(0), features_fake.mean(0))
+            # -------------------- RL & Value losses ---------------------------------------------
+            la_curr = 1.0 if epoch < self.no_rl_epochs else self.la
+            if la_curr < 1.0:
+                value_logit_real, _ = self.V(
+                    a_tensor.detach(), None, x_tensor.detach(), torch.sigmoid
+                )
+                value_logit_fake, _ = self.V(edges_hat, None, nodes_hat, torch.sigmoid)
 
-            # Real Reward
-            # reward_r = torch.from_numpy(self.reward(mols)).to(self.device)
-            # Fake Reward
-            # reward_f = self.get_reward(nodes_hat, edges_hat, self.post_method)
+                reward_r = torch.from_numpy(self.reward(mols)).to(self.device)
+                reward_f = self.get_reward(nodes_hat, edges_hat, self.post_method)
 
-            # Losses Update
-            loss_G = -logits_fake
-            # Original TF loss_V. Here we use absolute values instead of the squared one.
-            # loss_V = F.l1_loss(value_logit_real, reward_r) + F.l1_loss(
-            #     value_logit_fake, reward_f
-            # )
-            # loss_RL = -value_logit_fake
+                loss_V = torch.mean(
+                    (value_logit_real - reward_r) ** 2
+                    + (value_logit_fake - reward_f) ** 2
+                )
+                loss_RL = -torch.mean(value_logit_fake)
 
-            loss_G = torch.mean(loss_G)
-            # loss_V = torch.mean(loss_V)
-            # loss_RL = torch.mean(loss_RL)
-            losses["l_G"].append(loss_G.item())
-            # losses["l_RL"].append(loss_RL.item())
-            # losses["l_V"].append(loss_V.item())
+                alpha = torch.abs(loss_G_adv.detach() / loss_RL.detach())
+                gen_total_loss = la_curr * loss_G_adv + (1 - la_curr) * alpha * loss_RL
+            else:
+                loss_V = torch.zeros(1, device=self.device).float()
+                loss_RL = torch.zeros(1, device=self.device).float()
+                gen_total_loss = loss_G_adv
 
-            # alpha = torch.abs(loss_G.detach() / loss_RL.detach()).detach()
-            # train_step_G = cur_la * loss_G + (1 - cur_la) * alpha * loss_RL
-
-            self.reset_grad()
-
-            # Optimise generator.
             if cur_step % self.n_critic == 0:
-                loss_G.backward(retain_graph=True)
+                # -------------------- Generator update --------------------------------------
+                self.g_optimizer.zero_grad()
+                gen_total_loss.backward(retain_graph=True)
                 self.g_optimizer.step()
 
-            # Optimise value network.
-            # if cur_step % self.n_critic == 0:
-            #     loss_V.backward()
-            #     self.v_optimizer.step()
+                # -------------------- Value network update (only if lambda_wgan < 1) --------
+                if self.la < 1.0:
+                    self.v_optimizer.zero_grad()
+                    loss_V.backward()
+                    self.v_optimizer.step()
+
+            # Record.
+            losses["l_G"].append(loss_G_adv.item())
+            losses["l_RL"].append(loss_RL.item())
+            losses["l_V"].append(loss_V.item())
 
         # Save checkpoints.
         if self.mode == "train" and (epoch + 1) % self.model_save_step == 0:
@@ -445,16 +461,18 @@ class Solver(object):
         return losses
 
     @torch.no_grad()
-    def validate_epoch(self, epoch):
+    def validate_epoch(self, epoch, val_n=None):
         molecules = []
         self.G.eval()
-        val_n = self.data.validation_count
+
+        if val_n is None:
+            val_n = self.data.validation_count
         val_steps = val_n // self.batch_size
+
         metrics_acc = defaultdict(list)
 
-        for _ in range(val_steps):
+        for _ in range(val_steps + 1):
             # advance the validation counter (we ignore the outputs)
-            self.data.next_validation_batch(self.batch_size)
             z = self.sample_z(self.batch_size)
             edges_logits, nodes_logits = self.G(z)
             molecules.extend(

@@ -5,7 +5,6 @@ import numpy as np
 from layers import (
     GraphConvolution,
     GraphAggregation,
-    MultiGraphConvolutionLayers,
     MultiDenseLayer,
 )
 
@@ -44,12 +43,23 @@ class Discriminator(nn.Module):
     """Discriminator network with PatchGAN."""
 
     def __init__(
-        self, conv_dim, m_dim, b_dim, with_features=False, f_dim=0, dropout_rate=0.0
+        self,
+        conv_dim,
+        m_dim,
+        b_dim,
+        with_features: bool = False,
+        f_dim: int = 0,
+        dropout_rate: float = 0.0,
+        batch_discriminator: bool = False,
     ):
-        super(Discriminator, self).__init__()
+        super().__init__()
+
         self.activation_f = torch.nn.Tanh()
-        graph_conv_dim, aux_dim, linear_dim = conv_dim
-        # discriminator
+        self.batch_discriminator = batch_discriminator
+
+        graph_conv_dim, aux_dim, linear_dim = conv_dim  # unpack
+
+        # ---------------- Encoder (shared with everything inside this block) -------------
         self.gcn_layer = GraphConvolution(
             m_dim, graph_conv_dim, b_dim, with_features, f_dim, dropout_rate
         )
@@ -65,14 +75,45 @@ class Discriminator(nn.Module):
             aux_dim, linear_dim, self.activation_f, dropout_rate=dropout_rate
         )
 
-        self.output_layer = nn.Linear(linear_dim[-1], 1)
+        # ---------------- Batch-discriminator pathway -----------------------------------
+        if self.batch_discriminator:
+            bd_dim = linear_dim[-2] // 8  # same heuristic as TF implementation
+            self.bd_fc1 = nn.Linear(aux_dim, bd_dim)
+            self.bd_fc2 = nn.Linear(bd_dim, bd_dim)
+            final_in = linear_dim[-1] + bd_dim
+        else:
+            self.bd_fc1 = None
+            self.bd_fc2 = None
+            final_in = linear_dim[-1]
 
+        # Final scalar output
+        self.output_layer = nn.Linear(final_in, 1)
+
+    # -------------------------------------------------------------------------
+    # Forward pass: returns (logits, features) where *features* is the vector
+    # after the dense stack (and after minibatch concat if enabled) so that the
+    # feature-matching loss can use it.
+    # -------------------------------------------------------------------------
     def forward(self, adj, hidden, node, activation=None):
+        # Pre-process adjacency to separate edge types
         adj = adj[:, :, :, 1:].permute(0, 3, 1, 2)
-        h_1 = self.gcn_layer(node, adj, hidden)
-        h = self.agg_layer(h_1, node, hidden)
-        h = self.multi_dense_layer(h)
 
+        # Encoder
+        h_enc = self.gcn_layer(node, adj, hidden)
+        h_enc = self.agg_layer(h_enc, node, hidden)
+
+        # Local dense stack
+        h = self.multi_dense_layer(h_enc)  # (B, linear_dim[-1])
+
+        # Minibatch discriminator (batch-level feature) if enabled
+        if self.batch_discriminator:
+            bd = torch.tanh(self.bd_fc1(h_enc))  # (B, bd_dim)
+            bd_mean = bd.mean(dim=0, keepdim=True)  # (1, bd_dim)
+            bd = torch.tanh(self.bd_fc2(bd_mean))  # (1, bd_dim)
+            bd = bd.repeat(h.size(0), 1)  # tile to batch
+            h = torch.cat([h, bd], dim=-1)
+
+        # Final score
         output = self.output_layer(h)
         output = activation(output) if activation is not None else output
 
