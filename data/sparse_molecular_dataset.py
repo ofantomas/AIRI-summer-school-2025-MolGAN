@@ -51,6 +51,7 @@ class SparseMolecularDataset:
             self.data = [
                 Chem.MolFromSmiles(line) for line in open(filename, "r").readlines()
             ]
+            self.smiles = [line.strip() for line in open(filename, "r").readlines()]
 
         self.data = list(map(Chem.AddHs, self.data)) if add_h else self.data
         self.data = list(filter(filters, self.data))
@@ -310,6 +311,10 @@ class SparseMolecularDataset:
         self.validation_count = validation
         self.test_count = test
 
+        self.train_smiles = [self.smiles[i] for i in self.train_idx]
+        self.validation_smiles = [self.smiles[i] for i in self.validation_idx]
+        self.test_smiles = [self.smiles[i] for i in self.test_idx]
+
         self.log(
             "Created train ({} items), validation ({} items) and test ({} items) sets!".format(
                 train, validation, test
@@ -411,8 +416,8 @@ if __name__ == "__main__":
     data = SparseMolecularDataset()
     data.generate(
         "qm9_5k.smi",
-        validation=0.00021,
-        test=0.00021,
+        validation=0.025,
+        test=0.025,
         filters=lambda x: x.GetNumAtoms() <= 9,
     )
     # data.generate("qm9_5k.smi", filters=lambda x: x.GetNumAtoms() <= 9)
