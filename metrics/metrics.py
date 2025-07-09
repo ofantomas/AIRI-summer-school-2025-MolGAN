@@ -47,11 +47,17 @@ def valid_total_score(mols, n_jobs=1):
 
 def unique_scores(mols, n_jobs=1):
     canonic = mapper(n_jobs)(canonic_smiles, mols)
-    counts = Counter([s for s in canonic if s is not None])
-    return np.array(
-        [1.0 if s is not None and counts[s] == 1 else 0.0 for s in canonic],
-        dtype=np.float32,
-    )
+    seen = set()
+    result = []
+
+    for s in canonic:
+        if s is not None and s not in seen:
+            seen.add(s)
+            result.append(1.0)
+        else:
+            result.append(0.0)
+
+    return np.array(result, dtype=np.float32)
 
 
 def unique_total_score(mols, n_jobs=1, check_validity=True):
