@@ -9,7 +9,18 @@ import torch
 import torch.nn.functional as F
 from data.sparse_molecular_dataset import SparseMolecularDataset
 from models_gan import Discriminator, Generator
-from utils import MolecularMetrics, all_scores, save_mol_img
+from metrics.metrics import (
+    compute_metrics,
+    natural_product_scores,
+    water_octanol_partition_coefficient_scores,
+    sa_scores,
+    qed_scores,
+    novel_scores,
+    unique_scores,
+    diversity_scores,
+    valid_scores,
+)
+# from utils import save_mol_img
 
 
 class Solver(object):
@@ -228,21 +239,14 @@ class Solver(object):
         """
         # Define metric calculation mapping
         metric_calculators = {
-            "np": lambda m: MolecularMetrics.natural_product_scores(m, norm=True),
-            "logp": lambda m: MolecularMetrics.water_octanol_partition_coefficient_scores(
-                m, norm=True
-            ),
-            "sas": lambda m: MolecularMetrics.synthetic_accessibility_score_scores(
-                m, norm=True
-            ),
-            "qed": lambda m: MolecularMetrics.quantitative_estimation_druglikeness_scores(
-                m, norm=True
-            ),
-            "novelty": lambda m: MolecularMetrics.novel_scores(m, self.data),
-            "dc": lambda m: MolecularMetrics.drugcandidate_scores(m, self.data),
-            "unique": lambda m: MolecularMetrics.unique_scores(m),
-            "diversity": lambda m: MolecularMetrics.diversity_scores(m, self.data),
-            "validity": lambda m: MolecularMetrics.valid_scores(m),
+            "np": lambda m: natural_product_scores(m, norm=True),
+            "logp": lambda m: water_octanol_partition_coefficient_scores(m, norm=True),
+            "sas": lambda m: sa_scores(m, norm=True),
+            "qed": lambda m: qed_scores(m, norm=True),
+            "novelty": lambda m: novel_scores(m, self.data),
+            "unique": lambda m: unique_scores(m),
+            "diversity": lambda m: diversity_scores(m, self.data),
+            "validity": lambda m: valid_scores(m),
         }
 
         # Parse metrics to evaluate
@@ -469,8 +473,6 @@ class Solver(object):
             val_n = self.data.validation_count
         val_steps = val_n // self.batch_size
 
-        metrics_acc = defaultdict(list)
-
         for _ in range(val_steps + 1):
             # advance the validation counter (we ignore the outputs)
             z = self.sample_z(self.batch_size)
@@ -479,18 +481,9 @@ class Solver(object):
                 self.get_gen_mols(nodes_logits, edges_logits, self.post_method)
             )
 
-        m0, m1 = all_scores(molecules, self.data, norm=True)
-        for k, v in m1.items():
-            metrics_acc[k].append(v)
-        for k, v in m0.items():
-            metrics_acc[k].append(np.array(v)[np.nonzero(v)].mean())
-
-        # average & report
-        # report = ", ".join(
-        #     f"{tag}: {sum(vals) / len(vals):.4f}" for tag, vals in metrics_acc.items()
-        # )
+        metrics = compute_metrics(molecules, self.data)
         score_str = ", ".join(
-            f"{tag}: {np.mean(vals):.2f}" for tag, vals in metrics_acc.items()
+            f"{tag}: {np.mean(vals):.2f}" for tag, vals in metrics.items()
         )
         msg = f"[Val][Epoch {epoch + 1}/{self.num_epochs}] {score_str}"
         print(msg)

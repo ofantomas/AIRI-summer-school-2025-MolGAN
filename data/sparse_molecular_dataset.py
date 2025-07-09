@@ -271,8 +271,7 @@ class SparseMolecularDataset:
         if strict:
             try:
                 Chem.SanitizeMol(mol)
-            except Exception as e:
-                # print(e)
+            except Exception as _:
                 mol = None
 
         return mol

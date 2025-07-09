@@ -1,487 +1,421 @@
-import gzip
-import math
-import pickle
+from multiprocessing import Pool
+from functools import partial
+
 
 import numpy as np
+import pandas as pd
+import scipy
 import rdkit
+import torch
+import torch.nn.functional as F
 from pysmiles import read_smiles
-from rdkit import Chem, DataStructs
-from rdkit.Chem import QED, AllChem, Crippen, Draw
+from rdkit import Chem
+from rdkit.Chem import MACCSkeys
+from rdkit.Chem.AllChem import GetMorganFingerprintAsBitVect as Morgan
+from rdkit.Chem import AllChem, Draw
 from sklearn.metrics import classification_report as sk_classification_report
 from sklearn.metrics import confusion_matrix
 from util_dir.utils_io import random_string
 
-NP_model = pickle.load(gzip.open("data/NP_score.pkl.gz"))
-SA_model = {
-    i[j]: float(i[0])
-    for i in pickle.load(gzip.open("data/SA_score.pkl.gz"))
-    for j in range(1, len(i))
-}
 
-
-class MolecularMetrics(object):
-    @staticmethod
-    def _avoid_sanitization_error(op):
+def get_mol(smiles_or_mol):
+    """
+    Loads SMILES/molecule into RDKit's object
+    """
+    if isinstance(smiles_or_mol, str):
+        if len(smiles_or_mol) == 0:
+            return None
+        mol = Chem.MolFromSmiles(smiles_or_mol)
+        if mol is None:
+            return None
         try:
-            return op()
+            Chem.SanitizeMol(mol)
         except ValueError:
             return None
+        return mol
+    return smiles_or_mol
 
-    @staticmethod
-    def remap(x, x_min, x_max):
-        return (x - x_min) / (x_max - x_min)
 
-    @staticmethod
-    def valid_lambda(x):
-        return x is not None and Chem.MolToSmiles(x) != ""
+def canonic_smiles(smiles_or_mol):
+    mol = get_mol(smiles_or_mol)
+    if mol is None:
+        return None
+    return Chem.MolToSmiles(mol)
 
-    @staticmethod
-    def valid_lambda_special(x):
-        s = Chem.MolToSmiles(x) if x is not None else ""
-        return x is not None and "*" not in s and "." not in s and s != ""
 
-    @staticmethod
-    def valid_scores(mols):
-        return np.array(
-            list(map(MolecularMetrics.valid_lambda_special, mols)), dtype=np.float32
+def mapper(n_jobs):
+    """
+    Returns function for map call.
+    If n_jobs == 1, will use standard map
+    If n_jobs > 1, will use multiprocessing pool
+    If n_jobs is a pool object, will return its map function
+    """
+    if n_jobs == 1:
+
+        def _mapper(*args, **kwargs):
+            return list(map(*args, **kwargs))
+
+        return _mapper
+    if isinstance(n_jobs, int):
+        pool = Pool(n_jobs)
+
+        def _mapper(*args, **kwargs):
+            try:
+                result = pool.map(*args, **kwargs)
+            finally:
+                pool.terminate()
+            return result
+
+        return _mapper
+    return n_jobs.map
+
+
+def fingerprint(
+    smiles_or_mol,
+    fp_type="maccs",
+    dtype=None,
+    morgan__r=2,
+    morgan__n=1024,
+    *args,
+    **kwargs,
+):
+    """
+    Generates fingerprint for SMILES
+    If smiles is invalid, returns None
+    Returns numpy array of fingerprint bits
+
+    Parameters:
+        smiles: SMILES string
+        type: type of fingerprint: [MACCS|morgan]
+        dtype: if not None, specifies the dtype of returned array
+    """
+    fp_type = fp_type.lower()
+    molecule = get_mol(smiles_or_mol, *args, **kwargs)
+    if molecule is None:
+        return None
+    if fp_type == "maccs":
+        keys = MACCSkeys.GenMACCSKeys(molecule)
+        keys = np.array(keys.GetOnBits())
+        fingerprint = np.zeros(166, dtype="uint8")
+        if len(keys) != 0:
+            fingerprint[keys - 1] = 1  # We drop 0-th key that is always zero
+    elif fp_type == "morgan":
+        fingerprint = np.asarray(
+            Morgan(molecule, morgan__r, nBits=morgan__n), dtype="uint8"
         )
+    else:
+        raise ValueError("Unknown fingerprint type {}".format(fp_type))
+    if dtype is not None:
+        fingerprint = fingerprint.astype(dtype)
+    return fingerprint
 
-    @staticmethod
-    def valid_filter(mols):
-        return list(filter(MolecularMetrics.valid_lambda, mols))
 
-    @staticmethod
-    def valid_total_score(mols):
-        return np.array(
-            list(map(MolecularMetrics.valid_lambda, mols)), dtype=np.float32
-        ).mean()
+def fingerprints(smiles_mols_array, n_jobs=1, already_unique=False, *args, **kwargs):
+    """
+    Computes fingerprints of smiles np.array/list/pd.Series with n_jobs workers
+    e.g.fingerprints(smiles_mols_array, type='morgan', n_jobs=10)
+    Inserts np.NaN to rows corresponding to incorrect smiles.
+    IMPORTANT: if there is at least one np.NaN, the dtype would be float
+    Parameters:
+        smiles_mols_array: list/array/pd.Series of smiles or already computed
+            RDKit molecules
+        n_jobs: number of parralel workers to execute
+        already_unique: flag for performance reasons, if smiles array is big
+            and already unique. Its value is set to True if smiles_mols_array
+            contain RDKit molecules already.
+    """
+    if isinstance(smiles_mols_array, pd.Series):
+        smiles_mols_array = smiles_mols_array.values
+    else:
+        smiles_mols_array = np.asarray(smiles_mols_array)
+    if not isinstance(smiles_mols_array[0], str):
+        already_unique = True
 
-    @staticmethod
-    def novel_scores(mols, data):
-        return np.array(
-            list(
-                map(
-                    lambda x: MolecularMetrics.valid_lambda(x)
-                    and Chem.MolToSmiles(x) not in data.smiles,
-                    mols,
+    if not already_unique:
+        smiles_mols_array, inv_index = np.unique(smiles_mols_array, return_inverse=True)
+
+    fps = mapper(n_jobs)(partial(fingerprint, *args, **kwargs), smiles_mols_array)
+
+    length = 1
+    for fp in fps:
+        if fp is not None:
+            length = fp.shape[-1]
+            first_fp = fp
+            break
+    fps = [
+        fp if fp is not None else np.array([np.NaN]).repeat(length)[None, :]
+        for fp in fps
+    ]
+    if scipy.sparse.issparse(first_fp):
+        fps = scipy.sparse.vstack(fps).tocsr()
+    else:
+        fps = np.vstack(fps)
+    if not already_unique:
+        return fps[inv_index]
+    return fps
+
+
+def average_agg_tanimoto(
+    stock_vecs, gen_vecs, batch_size=5000, agg="max", device="cpu", p=1
+):
+    """
+    For each molecule in gen_vecs finds closest molecule in stock_vecs.
+    Returns average tanimoto score for between these molecules
+
+    Parameters:
+        stock_vecs: numpy array <n_vectors x dim>
+        gen_vecs: numpy array <n_vectors' x dim>
+        agg: max or mean
+        p: power for averaging: (mean x^p)^(1/p)
+    """
+    assert agg in ["max", "mean"], "Can aggregate only max or mean"
+    agg_tanimoto = np.zeros(len(gen_vecs))
+    total = np.zeros(len(gen_vecs))
+    for j in range(0, stock_vecs.shape[0], batch_size):
+        x_stock = torch.tensor(stock_vecs[j : j + batch_size]).to(device).float()
+        for i in range(0, gen_vecs.shape[0], batch_size):
+            y_gen = torch.tensor(gen_vecs[i : i + batch_size]).to(device).float()
+            y_gen = y_gen.transpose(0, 1)
+            tp = torch.mm(x_stock, y_gen)
+            jac = (
+                (tp / (x_stock.sum(1, keepdim=True) + y_gen.sum(0, keepdim=True) - tp))
+                .cpu()
+                .numpy()
+            )
+            jac[np.isnan(jac)] = 1
+            if p != 1:
+                jac = jac**p
+            if agg == "max":
+                agg_tanimoto[i : i + y_gen.shape[1]] = np.maximum(
+                    agg_tanimoto[i : i + y_gen.shape[1]], jac.max(0)
                 )
-            )
-        )
-
-    @staticmethod
-    def novel_filter(mols, data):
-        return list(
-            filter(
-                lambda x: MolecularMetrics.valid_lambda(x)
-                and Chem.MolToSmiles(x) not in data.smiles,
-                mols,
-            )
-        )
-
-    @staticmethod
-    def novel_total_score(mols, data):
-        return MolecularMetrics.novel_scores(
-            MolecularMetrics.valid_filter(mols), data
-        ).mean()
-
-    @staticmethod
-    def unique_scores(mols):
-        smiles = list(
-            map(
-                lambda x: Chem.MolToSmiles(x)
-                if MolecularMetrics.valid_lambda(x)
-                else "",
-                mols,
-            )
-        )
-        return np.clip(
-            0.75
-            + np.array(
-                list(map(lambda x: 1 / smiles.count(x) if x != "" else 0, smiles)),
-                dtype=np.float32,
-            ),
-            0,
-            1,
-        )
-
-    @staticmethod
-    def unique_total_score(mols):
-        v = MolecularMetrics.valid_filter(mols)
-        s = set(map(lambda x: Chem.MolToSmiles(x), v))
-        return 0 if len(v) == 0 else len(s) / len(v)
-
-    # @staticmethod
-    # def novel_and_unique_total_score(mols, data):
-    #     return ((MolecularMetrics.unique_scores(mols) == 1).astype(float) * MolecularMetrics.novel_scores(mols,
-    #                                                                                                       data)).sum()
-    #
-    # @staticmethod
-    # def reconstruction_scores(data, model, session, sample=False):
-    #
-    #     m0, _, _, a, x, _, f, _, _ = data.next_validation_batch()
-    #     feed_dict = {model.edges_labels: a, model.nodes_labels: x, model.node_features: f, model.training: False}
-    #
-    #     try:
-    #         feed_dict.update({model.variational: False})
-    #     except AttributeError:
-    #         pass
-    #
-    #     n, e = session.run([model.nodes_gumbel_argmax, model.edges_gumbel_argmax] if sample else [
-    #         model.nodes_argmax, model.edges_argmax], feed_dict=feed_dict)
-    #
-    #     n, e = np.argmax(n, axis=-1), np.argmax(e, axis=-1)
-    #
-    #     m1 = [data.matrices2mol(n_, e_, strict=True) for n_, e_ in zip(n, e)]
-    #
-    #     return np.mean([float(Chem.MolToSmiles(m0_) == Chem.MolToSmiles(m1_)) if m1_ is not None else 0
-    #             for m0_, m1_ in zip(m0, m1)])
-
-    @staticmethod
-    def natural_product_scores(mols, norm=False):
-        # calculating the score
-        scores = [
-            sum(
-                NP_model.get(bit, 0)
-                for bit in Chem.rdMolDescriptors.GetMorganFingerprint(
-                    mol, 2
-                ).GetNonzeroElements()
-            )
-            / float(mol.GetNumAtoms())
-            if mol is not None
-            else None
-            for mol in mols
-        ]
-
-        # preventing score explosion for exotic molecules
-        scores = list(
-            map(
-                lambda score: score
-                if score is None
-                else (
-                    4 + math.log10(score - 4 + 1)
-                    if score > 4
-                    else (-4 - math.log10(-4 - score + 1) if score < -4 else score)
-                ),
-                scores,
-            )
-        )
-
-        scores = np.array(list(map(lambda x: -4 if x is None else x, scores)))
-        scores = (
-            np.clip(MolecularMetrics.remap(scores, -3, 1), 0.0, 1.0) if norm else scores
-        )
-
-        return scores
-
-    @staticmethod
-    def quantitative_estimation_druglikeness_scores(mols, norm=False):
-        return np.array(
-            list(
-                map(
-                    lambda x: 0 if x is None else x,
-                    [
-                        MolecularMetrics._avoid_sanitization_error(lambda: QED.qed(mol))
-                        if mol is not None
-                        else None
-                        for mol in mols
-                    ],
-                )
-            )
-        )
-
-    @staticmethod
-    def water_octanol_partition_coefficient_scores(mols, norm=False):
-        scores = [
-            MolecularMetrics._avoid_sanitization_error(lambda: Crippen.MolLogP(mol))
-            if mol is not None
-            else None
-            for mol in mols
-        ]
-        scores = np.array(list(map(lambda x: -3 if x is None else x, scores)))
-        scores = (
-            np.clip(
-                MolecularMetrics.remap(scores, -2.12178879609, 6.0429063424), 0.0, 1.0
-            )
-            if norm
-            else scores
-        )
-
-        return scores
-
-    @staticmethod
-    def _compute_SAS(mol):
-        fp = Chem.rdMolDescriptors.GetMorganFingerprint(mol, 2)
-        fps = fp.GetNonzeroElements()
-        score1 = 0.0
-        nf = 0
-        # for bitId, v in fps.items():
-        for bitId, v in fps.items():
-            nf += v
-            sfp = bitId
-            score1 += SA_model.get(sfp, -4) * v
-        score1 /= nf
-
-        # features score
-        nAtoms = mol.GetNumAtoms()
-        nChiralCenters = len(Chem.FindMolChiralCenters(mol, includeUnassigned=True))
-        ri = mol.GetRingInfo()
-        nSpiro = Chem.rdMolDescriptors.CalcNumSpiroAtoms(mol)
-        nBridgeheads = Chem.rdMolDescriptors.CalcNumBridgeheadAtoms(mol)
-        nMacrocycles = 0
-        for x in ri.AtomRings():
-            if len(x) > 8:
-                nMacrocycles += 1
-
-        sizePenalty = nAtoms**1.005 - nAtoms
-        stereoPenalty = math.log10(nChiralCenters + 1)
-        spiroPenalty = math.log10(nSpiro + 1)
-        bridgePenalty = math.log10(nBridgeheads + 1)
-        macrocyclePenalty = 0.0
-
-        # ---------------------------------------
-        # This differs from the paper, which defines:
-        #  macrocyclePenalty = math.log10(nMacrocycles+1)
-        # This form generates better results when 2 or more macrocycles are present
-        if nMacrocycles > 0:
-            macrocyclePenalty = math.log10(2)
-
-        score2 = (
-            0.0
-            - sizePenalty
-            - stereoPenalty
-            - spiroPenalty
-            - bridgePenalty
-            - macrocyclePenalty
-        )
-
-        # correction for the fingerprint density
-        # not in the original publication, added in version 1.1
-        # to make highly symmetrical molecules easier to synthetise
-        score3 = 0.0
-        if nAtoms > len(fps):
-            score3 = math.log(float(nAtoms) / len(fps)) * 0.5
-
-        sascore = score1 + score2 + score3
-
-        # need to transform "raw" value into scale between 1 and 10
-        min = -4.0
-        max = 2.5
-        sascore = 11.0 - (sascore - min + 1) / (max - min) * 9.0
-        # smooth the 10-end
-        if sascore > 8.0:
-            sascore = 8.0 + math.log(sascore + 1.0 - 9.0)
-        if sascore > 10.0:
-            sascore = 10.0
-        elif sascore < 1.0:
-            sascore = 1.0
-
-        return sascore
-
-    @staticmethod
-    def synthetic_accessibility_score_scores(mols, norm=False):
-        scores = [
-            MolecularMetrics._compute_SAS(mol) if mol is not None else None
-            for mol in mols
-        ]
-        scores = np.array(list(map(lambda x: 10 if x is None else x, scores)))
-        scores = (
-            np.clip(MolecularMetrics.remap(scores, 5, 1.5), 0.0, 1.0)
-            if norm
-            else scores
-        )
-
-        return scores
-
-    @staticmethod
-    def diversity_scores(mols, data):
-        rand_mols = np.random.choice(data.data, 100)
-        fps = [
-            Chem.rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, 4, nBits=2048)
-            for mol in rand_mols
-        ]
-
-        scores = np.array(
-            list(
-                map(
-                    lambda x: MolecularMetrics.__compute_diversity(x, fps)
-                    if x is not None
-                    else 0,
-                    mols,
-                )
-            )
-        )
-        scores = np.clip(MolecularMetrics.remap(scores, 0.9, 0.945), 0.0, 1.0)
-
-        return scores
-
-    @staticmethod
-    def __compute_diversity(mol, fps):
-        ref_fps = Chem.rdMolDescriptors.GetMorganFingerprintAsBitVect(
-            mol, 4, nBits=2048
-        )
-        dist = DataStructs.BulkTanimotoSimilarity(ref_fps, fps, returnDistance=True)
-        score = np.mean(dist)
-        return score
-
-    @staticmethod
-    def drugcandidate_scores(mols, data):
-        scores = (
-            MolecularMetrics.constant_bump(
-                MolecularMetrics.water_octanol_partition_coefficient_scores(
-                    mols, norm=True
-                ),
-                0.210,
-                0.945,
-            )
-            + MolecularMetrics.synthetic_accessibility_score_scores(mols, norm=True)
-            + MolecularMetrics.novel_scores(mols, data)
-            + (1 - MolecularMetrics.novel_scores(mols, data)) * 0.3
-        ) / 4
-
-        return scores
-
-    @staticmethod
-    def constant_bump(x, x_low, x_high, decay=0.025):
-        return np.select(
-            condlist=[x <= x_low, x >= x_high],
-            choicelist=[
-                np.exp(-((x - x_low) ** 2) / decay),
-                np.exp(-((x - x_high) ** 2) / decay),
-            ],
-            default=np.ones_like(x),
-        )
+            elif agg == "mean":
+                agg_tanimoto[i : i + y_gen.shape[1]] += jac.sum(0)
+                total[i : i + y_gen.shape[1]] += jac.shape[0]
+    if agg == "mean":
+        agg_tanimoto /= total
+    if p != 1:
+        agg_tanimoto = (agg_tanimoto) ** (1 / p)
+    return np.mean(agg_tanimoto)
 
 
-def mols2grid_image(mols, molsPerRow):
-    mols = [e if e is not None else Chem.RWMol() for e in mols]
+def classification_report(
+    data,
+    encoder,
+    decoder,
+    device: torch.device = torch.device("cpu"),
+    sample: bool = False,
+):
+    """Compute and print per-class metrics for node and edge reconstruction using PyTorch models.
 
-    for mol in mols:
-        AllChem.Compute2DCoords(mol)
+    Parameters
+    ----------
+    data : SparseMolecularDataset
+        Dataset that provides `next_validation_batch()` and decoders for atoms/bonds.
+    encoder : torch.nn.Module
+        Trained encoder network that maps (A, F, X) -> latent z.
+    decoder : torch.nn.Module
+        Decoder (a.k.a. generator) that maps latent z -> (edge_logits, node_logits).
+    device : torch.device, optional
+        CUDA / CPU device where the networks live. Default: CPU.
+    sample : bool, optional
+        If True uses Gumbel-softmax (hard) sampling before argmax, otherwise takes argmax over raw logits.
+    """
+    encoder.eval()
+    decoder.eval()
 
-    return Draw.MolsToGridImage(mols, molsPerRow=molsPerRow, subImgSize=(150, 150))
-
-
-def classification_report(data, model, session, sample=False):
+    # Grab one full validation batch (no batch_size argument returns the whole set)
     _, _, _, a, x, _, f, _, _ = data.next_validation_batch()
 
-    n, e = session.run(
-        [model.nodes_gumbel_argmax, model.edges_gumbel_argmax]
-        if sample
-        else [model.nodes_argmax, model.edges_argmax],
-        feed_dict={
-            model.edges_labels: a,
-            model.nodes_labels: x,
-            model.node_features: f,
-            model.training: False,
-            model.variational: False,
-        },
-    )
-    n, e = np.argmax(n, axis=-1), np.argmax(e, axis=-1)
+    # Convert numpy arrays -> torch tensors on the correct device
+    a = torch.from_numpy(a).to(device).long()  # (B, V, V)
+    x = torch.from_numpy(x).to(device).long()  # (B, V)
+    f = torch.from_numpy(f).to(device).float()  # (B, V, F)
 
-    y_true = e.flatten()
-    y_pred = a.flatten()
-    target_names = [
+    # One-hot encode adjacency & node labels so that they match training inputs
+    a_onehot = F.one_hot(a, num_classes=data.bond_num_types).float()  # (B, V, V, Eb)
+    x_onehot = F.one_hot(x, num_classes=data.atom_num_types).float()  # (B, V, Ea)
+
+    with torch.no_grad():
+        # Encode -> sample latent -> Decode
+        z, _, _ = encoder(a_onehot, f, x_onehot)
+        edges_logits, nodes_logits = decoder(z)
+
+        # edges_logits : (B, V, V, Eb)
+        # nodes_logits : (B, V, Ea)
+
+        if sample:
+            # Gumbel-softmax sampling (hard) before argmax, similar to TF version
+            edges_hat = F.gumbel_softmax(
+                edges_logits.view(-1, edges_logits.size(-1)), hard=True
+            )
+            edges_hat = edges_hat.view_as(edges_logits)
+            nodes_hat = F.gumbel_softmax(
+                nodes_logits.view(-1, nodes_logits.size(-1)), hard=True
+            )
+            nodes_hat = nodes_hat.view_as(nodes_logits)
+            e_pred = edges_hat.argmax(dim=-1).cpu().numpy()
+            n_pred = nodes_hat.argmax(dim=-1).cpu().numpy()
+        else:
+            e_pred = edges_logits.argmax(dim=-1).cpu().numpy()
+            n_pred = nodes_logits.argmax(dim=-1).cpu().numpy()
+
+    # Ground-truth labels
+    e_true = a.cpu().numpy()
+    n_true = x.cpu().numpy()
+
+    # ---------- Edge-type metrics ----------
+    y_true_e = e_true.flatten()
+    y_pred_e = e_pred.flatten()
+    bond_target_names = [
         str(Chem.rdchem.BondType.values[int(e)]) for e in data.bond_decoder_m.values()
     ]
 
-    print("######## Classification Report ########\n")
+    print("######## Bond Classification Report ########\n")
     print(
         sk_classification_report(
-            y_true,
-            y_pred,
-            labels=list(range(len(target_names))),
-            target_names=target_names,
+            y_true_e,
+            y_pred_e,
+            labels=list(range(len(bond_target_names))),
+            target_names=bond_target_names,
         )
     )
+    print("######## Bond Confusion Matrix ########\n")
+    print(
+        confusion_matrix(y_true_e, y_pred_e, labels=list(range(len(bond_target_names))))
+    )
 
-    print("######## Confusion Matrix ########\n")
-    print(confusion_matrix(y_true, y_pred, labels=list(range(len(target_names)))))
+    # ---------- Atom-type metrics ----------
+    y_true_n = n_true.flatten()
+    y_pred_n = n_pred.flatten()
+    atom_target_names = [Chem.Atom(e).GetSymbol() for e in data.atom_decoder_m.values()]
 
-    y_true = n.flatten()
-    y_pred = x.flatten()
-    target_names = [Chem.Atom(e).GetSymbol() for e in data.atom_decoder_m.values()]
-
-    print("######## Classification Report ########\n")
+    print("\n######## Atom Classification Report ########\n")
     print(
         sk_classification_report(
-            y_true,
-            y_pred,
-            labels=list(range(len(target_names))),
-            target_names=target_names,
+            y_true_n,
+            y_pred_n,
+            labels=list(range(len(atom_target_names))),
+            target_names=atom_target_names,
         )
     )
+    print("\n######## Atom Confusion Matrix ########\n")
+    print(
+        confusion_matrix(y_true_n, y_pred_n, labels=list(range(len(atom_target_names))))
+    )
 
-    print("\n######## Confusion Matrix ########\n")
-    print(confusion_matrix(y_true, y_pred, labels=list(range(len(target_names)))))
 
+def reconstructions(
+    data,
+    encoder,
+    decoder,
+    device: torch.device = torch.device("cpu"),
+    batch_dim: int = 10,
+    sample: bool = False,
+):
+    """Return a flattened list [orig1, recon1, orig2, recon2, ...] for a training batch.
 
-def reconstructions(data, model, session, batch_dim=10, sample=False):
+    Parameters
+    ----------
+    data : SparseMolecularDataset
+        Dataset providing `next_train_batch` and `matrices2mol`.
+    encoder : torch.nn.Module
+        Trained encoder network that maps (A, F, X) -> latent z.
+    decoder : torch.nn.Module
+        Decoder (generator) mapping z → (edge_logits, node_logits).
+    device : torch.device, optional
+        Device to run inference on.
+    batch_dim : int, optional
+        Batch size for the reconstruction set.
+    sample : bool, optional
+        If True, apply hard Gumbel-Softmax before argmax.
+    """
+    # Get batch of real molecules
     m0, _, _, a, x, _, f, _, _ = data.next_train_batch(batch_dim)
 
-    n, e = session.run(
-        [model.nodes_gumbel_argmax, model.edges_gumbel_argmax]
-        if sample
-        else [model.nodes_argmax, model.edges_argmax],
-        feed_dict={
-            model.edges_labels: a,
-            model.nodes_labels: x,
-            model.node_features: f,
-            model.training: False,
-            model.variational: False,
-        },
-    )
-    n, e = np.argmax(n, axis=-1), np.argmax(e, axis=-1)
+    # Convert to tensors
+    a_t = torch.from_numpy(a).to(device).long()
+    x_t = torch.from_numpy(x).to(device).long()
+    f_t = torch.from_numpy(f).to(device).float()
 
-    m1 = np.array(
-        [
-            e if e is not None else Chem.RWMol()
-            for e in [data.matrices2mol(n_, e_, strict=True) for n_, e_ in zip(n, e)]
-        ]
-    )
+    a_onehot = F.one_hot(a_t, num_classes=data.bond_num_types).float()
+    x_onehot = F.one_hot(x_t, num_classes=data.atom_num_types).float()
 
+    encoder.eval()
+    decoder.eval()
+    with torch.no_grad():
+        z, _, _ = encoder(a_onehot, f_t, x_onehot)
+        edges_logits, nodes_logits = decoder(z)
+
+    # Post-processing
+    if sample:
+        edges_hat = F.gumbel_softmax(
+            edges_logits.view(-1, edges_logits.size(-1)), hard=True
+        ).view_as(edges_logits)
+        nodes_hat = F.gumbel_softmax(
+            nodes_logits.view(-1, nodes_logits.size(-1)), hard=True
+        ).view_as(nodes_logits)
+        e_pred = edges_hat.argmax(dim=-1).cpu().numpy()
+        n_pred = nodes_hat.argmax(dim=-1).cpu().numpy()
+    else:
+        e_pred = edges_logits.argmax(dim=-1).cpu().numpy()
+        n_pred = nodes_logits.argmax(dim=-1).cpu().numpy()
+
+    generated_mols = [
+        data.matrices2mol(n_, e_, strict=True) for n_, e_ in zip(n_pred, e_pred)
+    ]
+    m1 = np.array([mol if mol is not None else Chem.RWMol() for mol in generated_mols])
     mols = np.vstack((m0, m1)).T.flatten()
-
     return mols
 
 
-def samples(data, model, session, embeddings, sample=False):
-    n, e = session.run(
-        [model.nodes_gumbel_argmax, model.edges_gumbel_argmax]
-        if sample
-        else [model.nodes_argmax, model.edges_argmax],
-        feed_dict={model.embeddings: embeddings, model.training: False},
-    )
-    n, e = np.argmax(n, axis=-1), np.argmax(e, axis=-1)
+def samples(
+    data,
+    decoder,
+    embeddings,
+    device: torch.device = torch.device("cpu"),
+    sample: bool = False,
+):
+    """Generate molecules from latent `embeddings` with a PyTorch decoder.
 
-    mols = [data.matrices2mol(n_, e_, strict=True) for n_, e_ in zip(n, e)]
+    Parameters
+    ----------
+    data : SparseMolecularDataset
+        Provides `matrices2mol` helper.
+    decoder : torch.nn.Module
+        Generator/decoder returning (edge_logits, node_logits).
+    embeddings : np.ndarray | torch.Tensor
+        Latent vectors of shape (B, z_dim).
+    device : torch.device, optional
+        Execution device.
+    sample : bool, optional
+        If True, apply hard Gumbel-Softmax sampling before argmax.
+    """
+    # Prepare latent vectors
+    if isinstance(embeddings, np.ndarray):
+        z = torch.from_numpy(embeddings).to(device).float()
+    else:
+        z = embeddings.to(device)
 
+    decoder.eval()
+    with torch.no_grad():
+        edges_logits, nodes_logits = decoder(z)
+
+        if sample:
+            edges_hat = F.gumbel_softmax(
+                edges_logits.view(-1, edges_logits.size(-1)), hard=True
+            ).view_as(edges_logits)
+            nodes_hat = F.gumbel_softmax(
+                nodes_logits.view(-1, nodes_logits.size(-1)), hard=True
+            ).view_as(nodes_logits)
+            e_pred = edges_hat.argmax(dim=-1).cpu().numpy()
+            n_pred = nodes_hat.argmax(dim=-1).cpu().numpy()
+        else:
+            e_pred = edges_logits.argmax(dim=-1).cpu().numpy()
+            n_pred = nodes_logits.argmax(dim=-1).cpu().numpy()
+
+    mols = [data.matrices2mol(n_, e_, strict=True) for n_, e_ in zip(n_pred, e_pred)]
     return mols
-
-
-def all_scores(mols, data, norm=False, reconstruction=False):
-    m0 = {
-        k: list(filter(lambda e: e is not None, v))
-        for k, v in {
-            "NP": MolecularMetrics.natural_product_scores(mols, norm=norm),
-            "QED": MolecularMetrics.quantitative_estimation_druglikeness_scores(mols),
-            "Solute": MolecularMetrics.water_octanol_partition_coefficient_scores(
-                mols, norm=norm
-            ),
-            "SA": MolecularMetrics.synthetic_accessibility_score_scores(
-                mols, norm=norm
-            ),
-            "diverse": MolecularMetrics.diversity_scores(mols, data),
-            "drugcand": MolecularMetrics.drugcandidate_scores(mols, data),
-        }.items()
-    }
-
-    m1 = {
-        "valid": MolecularMetrics.valid_total_score(mols) * 100,
-        "unique": MolecularMetrics.unique_total_score(mols) * 100,
-        "novel": MolecularMetrics.novel_total_score(mols, data) * 100,
-    }
-
-    return m0, m1
 
 
 def save_mol_img(mols, f_name="tmp.png", is_test=False):
@@ -499,7 +433,7 @@ def save_mol_img(mols, f_name="tmp.png", is_test=False):
 
                 rdkit.Chem.Draw.MolToFile(a_mol, f_name)
                 a_smi = Chem.MolToSmiles(a_mol)
-                mol_graph = read_smiles(a_smi)
+                _ = read_smiles(a_smi)
 
                 break
 
@@ -508,3 +442,12 @@ def save_mol_img(mols, f_name="tmp.png", is_test=False):
         except Exception as e:
             print(e)
             continue
+
+
+def mols2grid_image(mols, molsPerRow):
+    mols = [e if e is not None else Chem.RWMol() for e in mols]
+
+    for mol in mols:
+        AllChem.Compute2DCoords(mol)
+
+    return Draw.MolsToGridImage(mols, molsPerRow=molsPerRow, subImgSize=(150, 150))

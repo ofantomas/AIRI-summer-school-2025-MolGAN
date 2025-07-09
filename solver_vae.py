@@ -5,15 +5,21 @@ import os
 import time
 import datetime
 
-import rdkit
 import torch
 import torch.nn.functional as F
-from pysmiles import read_smiles
-from torch.autograd import Variable
-from torchvision.utils import save_image
 
-from util_dir.utils_io import random_string
-from utils import *
+from metrics.metrics import (
+    compute_metrics,
+    novel_scores,
+    natural_product_scores,
+    water_octanol_partition_coefficient_scores,
+    sa_scores,
+    qed_scores,
+    unique_scores,
+    diversity_scores,
+    valid_scores,
+)
+from utils import save_mol_img
 from models_vae import Generator, Discriminator, EncoderVAE
 from data.sparse_molecular_dataset import SparseMolecularDataset
 
@@ -164,7 +170,7 @@ class Solver(object):
     @staticmethod
     def postprocess_logits(inputs, method, temperature=1.0):
         def listify(x):
-            return x if type(x) == list or type(x) == tuple else [x]
+            return x if isinstance(x, (list, tuple)) else [x]
 
         def delistify(x):
             return x if len(x) > 1 else x[0]
@@ -198,29 +204,21 @@ class Solver(object):
             ","
         ):
             if m == "np":
-                rr *= MolecularMetrics.natural_product_scores(mols, norm=True)
+                rr *= natural_product_scores(mols, norm=True)
             elif m == "logp":
-                rr *= MolecularMetrics.water_octanol_partition_coefficient_scores(
-                    mols, norm=True
-                )
+                rr *= water_octanol_partition_coefficient_scores(mols, norm=True)
             elif m == "sas":
-                rr *= MolecularMetrics.synthetic_accessibility_score_scores(
-                    mols, norm=True
-                )
+                rr *= sa_scores(mols, norm=True)
             elif m == "qed":
-                rr *= MolecularMetrics.quantitative_estimation_druglikeness_scores(
-                    mols, norm=True
-                )
+                rr *= qed_scores(mols, norm=True)
             elif m == "novelty":
-                rr *= MolecularMetrics.novel_scores(mols, self.data)
-            elif m == "dc":
-                rr *= MolecularMetrics.drugcandidate_scores(mols, self.data)
+                rr *= novel_scores(mols, self.data)
             elif m == "unique":
-                rr *= MolecularMetrics.unique_scores(mols)
+                rr *= unique_scores(mols)
             elif m == "diversity":
-                rr *= MolecularMetrics.diversity_scores(mols, self.data)
+                rr *= diversity_scores(mols, self.data)
             elif m == "validity":
-                rr *= MolecularMetrics.valid_scores(mols)
+                rr *= valid_scores(mols)
             else:
                 raise RuntimeError("{} is not defined as a metric".format(m))
 
@@ -324,7 +322,7 @@ class Solver(object):
 
     def get_scores(self, mols, to_print=False):
         scores = defaultdict(list)
-        m0, m1 = all_scores(
+        m0, m1 = compute_metrics(
             mols, self.data, norm=True
         )  # 'mols' is output of Fake Reward
         for k, v in m1.items():
